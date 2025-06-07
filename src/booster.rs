@@ -469,6 +469,7 @@ impl Booster {
 
 impl Drop for Booster {
     fn drop(&mut self) {
+        info!("Dropping booster with handle: {:?}", self.handle);
         lgbm_call!(lightgbm3_sys::LGBM_BoosterFree(self.handle)).unwrap();
     }
 }

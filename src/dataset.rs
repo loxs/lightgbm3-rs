@@ -287,6 +287,7 @@ impl Dataset {
 impl Drop for Dataset {
     /// Frees up the underlying LightGBM Dataset.
     fn drop(&mut self) {
+        info!("Dropping Dataset with handle: {:?}", self.handle);
         lgbm_call!(lightgbm3_sys::LGBM_DatasetFree(self.handle)).unwrap();
     }
 }

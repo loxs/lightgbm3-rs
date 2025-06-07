@@ -54,6 +54,10 @@ pub use booster::{Booster, ImportanceType};
 pub use dataset::{DType, Dataset};
 pub use error::{Error, Result};
 
+#[macro_use]
+extern crate tracing;
+
+
 /// Get index of the element in a slice with the maximum value
 pub fn argmax<T: PartialOrd>(xs: &[T]) -> usize {
     if xs.len() == 1 {
