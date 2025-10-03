@@ -9,7 +9,7 @@ use lightgbm3_sys::BoosterHandle;
 
 /// Core model in LightGBM, containing functions for training, evaluating and predicting.
 pub struct Booster {
-    handle: BoosterHandle,
+    pub handle: BoosterHandle,
     n_features: i32,
     n_iterations: i32,   // number of trees in the booster
     max_iterations: i32, // maximum number of trees for prediction
