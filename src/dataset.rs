@@ -197,6 +197,38 @@ impl Dataset {
         is_row_major: bool,
         reference: Option<&Dataset>,
     ) -> Result<Self> {
+        Self::from_slice_full(flat_x, label, n_features, is_row_major, reference, None)
+    }
+
+    /// Creates a new `Dataset` (x, labels) from flat slice, passing extra LightGBM
+    /// params (e.g. `"max_bin=63"`) to `LGBM_DatasetCreateFromMat`.
+    ///
+    /// # Example
+    /// ```
+    /// use lightgbm3::Dataset;
+    ///
+    /// let x: Vec<f64> = vec![1.0, 0.1, 0.7, 0.4, 0.9, 0.8];
+    /// let label = vec![0.0, 0.0, 1.0];
+    /// let dataset = Dataset::from_slice_with_params(&x, &label, 2, true, "max_bin=63").unwrap();
+    /// ```
+    pub fn from_slice_with_params<T: DType>(
+        flat_x: &[T],
+        label: &[f32],
+        n_features: i32,
+        is_row_major: bool,
+        params: &str,
+    ) -> Result<Self> {
+        Self::from_slice_full(flat_x, label, n_features, is_row_major, None, Some(params))
+    }
+
+    fn from_slice_full<T: DType>(
+        flat_x: &[T],
+        label: &[f32],
+        n_features: i32,
+        is_row_major: bool,
+        reference: Option<&Dataset>,
+        params: Option<&str>,
+    ) -> Result<Self> {
         if n_features <= 0 {
             return Err(Error::new("number of features should be greater than 0"));
         }
@@ -215,7 +247,10 @@ impl Dataset {
                 n_rows
             )));
         }
-        let params = CString::new("").unwrap();
+        let params = params
+            .map(CString::new)
+            .unwrap_or_else(|| CString::new(""))
+            .unwrap();
         let label_str = CString::new("label").unwrap();
         let ref_handle = reference.map_or(std::ptr::null_mut(), |r| r.handle);
         let mut dataset_handle = std::ptr::null_mut();
@@ -308,8 +343,36 @@ impl Dataset {
     /// let valid = Dataset::from_file_with_reference(&"lightgbm3-sys/lightgbm/examples/binary_classification/binary.test", Some(&train)).unwrap();
     /// ```
     pub fn from_file_with_reference(file_path: &str, reference: Option<&Dataset>) -> Result<Self> {
+        Self::from_file_full(file_path, reference, None)
+    }
+
+    /// Create a new `Dataset` from file, passing extra LightGBM params (e.g.
+    /// `"two_round=true"` to avoid mapping the whole file into memory at once, for
+    /// files too big to comfortably fit in RAM).
+    ///
+    /// # Example
+    /// ```
+    /// use lightgbm3::Dataset;
+    ///
+    /// let dataset = Dataset::from_file_with_params(
+    ///     &"lightgbm3-sys/lightgbm/examples/binary_classification/binary.train",
+    ///     "two_round=true",
+    /// ).unwrap();
+    /// ```
+    pub fn from_file_with_params(file_path: &str, params: &str) -> Result<Self> {
+        Self::from_file_full(file_path, None, Some(params))
+    }
+
+    fn from_file_full(
+        file_path: &str,
+        reference: Option<&Dataset>,
+        params: Option<&str>,
+    ) -> Result<Self> {
         let file_path_str = CString::new(file_path).unwrap();
-        let params = CString::new("").unwrap();
+        let params = params
+            .map(CString::new)
+            .unwrap_or_else(|| CString::new(""))
+            .unwrap();
         let mut handle = std::ptr::null_mut();
         let ref_handle = reference.map_or(std::ptr::null_mut(), |r| r.handle);
 
