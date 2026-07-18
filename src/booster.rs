@@ -9,7 +9,7 @@ use lightgbm3_sys::{BoosterHandle, FastConfigHandle};
 
 /// Core model in LightGBM, containing functions for training, evaluating and predicting.
 pub struct Booster {
-    pub handle: BoosterHandle,
+    handle: BoosterHandle,
     n_features: i32,
     n_iterations: i32,   // number of trees in the booster
     max_iterations: i32, // maximum number of trees for prediction
@@ -680,6 +680,29 @@ impl Booster {
         is_row_major: bool,
     ) -> Result<Vec<f64>> {
         self.real_predict(flat_x, n_features, is_row_major, PredictType::Contrib, None)
+    }
+
+    /// Get feature contributions (SHAP values) given `&[f32]` or `&[f64]` slice of
+    /// features, with extra LightGBM params (e.g. `"num_threads=4"`).
+    ///
+    /// Example:
+    /// ```ignore
+    /// let contrib = bst.predict_contrib_with_params(&xs, 10, true, "num_threads=4").unwrap();
+    /// ```
+    pub fn predict_contrib_with_params<T: DType>(
+        &self,
+        flat_x: &[T],
+        n_features: i32,
+        is_row_major: bool,
+        params: &str,
+    ) -> Result<Vec<f64>> {
+        self.real_predict(
+            flat_x,
+            n_features,
+            is_row_major,
+            PredictType::Contrib,
+            Some(params),
+        )
     }
 
     /// Get raw scores given `&[f32]` or `&[f64]` slice of features. The resulting vector
