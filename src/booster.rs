@@ -5,7 +5,7 @@ use std::os::raw::{c_char, c_longlong, c_void};
 use std::{convert::TryInto, ffi::CString};
 
 use crate::{dataset::DType, Dataset, Error, Result};
-use lightgbm3_sys::BoosterHandle;
+use lightgbm3_sys::{BoosterHandle, FastConfigHandle};
 
 /// Core model in LightGBM, containing functions for training, evaluating and predicting.
 pub struct Booster {
@@ -14,6 +14,7 @@ pub struct Booster {
     n_iterations: i32,   // number of trees in the booster
     max_iterations: i32, // maximum number of trees for prediction
     n_classes: i32,
+    fast_config: Option<FastConfigHandle>, // for LGBM_BoosterPredictForMatSingleRowFast
 }
 
 /// Prediction type
@@ -22,6 +23,7 @@ pub struct Booster {
 enum PredictType {
     Normal,
     RawScore,
+    Contrib,
 }
 
 /// Type of feature importance
@@ -42,11 +44,13 @@ impl Booster {
             n_iterations: 0,
             max_iterations: 0,
             n_classes: 0,
+            fast_config: None,
         };
         booster.n_features = booster.inner_num_features()?;
         booster.n_iterations = booster.inner_num_iterations()?;
         booster.max_iterations = booster.n_iterations;
         booster.n_classes = booster.inner_num_classes()?;
+
         Ok(booster)
     }
 
@@ -134,6 +138,40 @@ impl Booster {
             .map_err(|_| Error::new("can't convert model string to unicode"))
     }
 
+    /// Initialize FastConfigHandle for use with [Booster::predict_single_row_fast]
+    pub fn single_row_fast_init<T: DType>(&mut self, params: Option<&Value>) -> Result<()> {
+        if let Some(fast_config) = self.fast_config.take() {
+            lgbm_call!(lightgbm3_sys::LGBM_FastConfigFree(fast_config))?;
+        }
+
+        let params_cstring = if let Some(params) = params {
+            let params_string = params
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(" ");
+            CString::new(params_string).unwrap()
+        } else {
+            CString::default()
+        };
+
+        let mut fast_config = FastConfigHandle::default();
+        lgbm_call!(lightgbm3_sys::LGBM_BoosterPredictForMatSingleRowFastInit(
+            self.handle,
+            PredictType::Normal.into(),
+            0,
+            self.max_iterations,
+            T::get_c_api_dtype(),
+            self.n_features,
+            params_cstring.as_ptr(),
+            &mut fast_config as *mut FastConfigHandle,
+        ))?;
+        self.fast_config = Some(fast_config);
+        Ok(())
+    }
+
     /// Get the number of classes.
     pub fn num_classes(&self) -> i32 {
         self.n_classes
@@ -195,9 +233,46 @@ impl Booster {
     /// Full set of parameters can be found on the official LightGBM docs:
     /// <https://lightgbm.readthedocs.io/en/latest/Parameters.html>
     pub fn train(dataset: Dataset, parameters: &Value) -> Result<Self> {
-        let num_iterations: i64 = parameters["num_iterations"].as_i64().unwrap_or(100);
+        Self::train_with_valid(dataset, None, parameters)
+    }
 
-        // exchange params {"x": "y", "z": 1} => "x=y z=1"
+    /// Trains a new model with optional validation dataset and early stopping.
+    ///
+    /// If `valid_dataset` is provided, you can use `early_stopping_rounds` in parameters
+    /// to stop training when the validation metric doesn't improve for N consecutive rounds.
+    ///
+    /// Example with early stopping:
+    /// ```
+    /// extern crate serde_json;
+    /// use lightgbm3::{Dataset, Booster};
+    /// use serde_json::json;
+    ///
+    /// let train_xs = vec![vec![1.0, 0.1], vec![0.7, 0.4], vec![0.9, 0.8], vec![0.2, 0.2]];
+    /// let train_labels = vec![0.0, 0.0, 1.0, 1.0];
+    /// let train_dataset = Dataset::from_vec_of_vec(train_xs, train_labels, true).unwrap();
+    ///
+    /// let valid_xs = vec![vec![0.8, 0.3], vec![0.3, 0.6]];
+    /// let valid_labels = vec![0.0, 1.0];
+    /// let valid_dataset = Dataset::from_vec_of_vec(valid_xs, valid_labels, true).unwrap();
+    ///
+    /// let params = json!{
+    ///    {
+    ///         "num_iterations": 100,
+    ///         "objective": "binary",
+    ///         "metric": "auc",
+    ///         "early_stopping_rounds": 10
+    ///     }
+    /// };
+    /// let bst = Booster::train_with_valid(train_dataset, Some(valid_dataset), &params).unwrap();
+    /// ```
+    pub fn train_with_valid(
+        dataset: Dataset,
+        valid_dataset: Option<Dataset>,
+        parameters: &Value,
+    ) -> Result<Self> {
+        let num_iterations: i64 = parameters["num_iterations"].as_i64().unwrap_or(100);
+        let early_stopping_rounds: Option<i64> = parameters["early_stopping_rounds"].as_i64();
+
         let params_string = parameters
             .as_object()
             .unwrap()
@@ -214,14 +289,280 @@ impl Booster {
             &mut handle
         ))?;
 
+        if let Some(ref valid) = valid_dataset {
+            lgbm_call!(lightgbm3_sys::LGBM_BoosterAddValidData(
+                handle,
+                valid.handle
+            ))?;
+        }
+
         let mut is_finished: i32 = 0;
-        for _ in 1..num_iterations {
+        let mut best_score: Option<f64> = None;
+        let mut rounds_without_improvement: i64 = 0;
+        let has_valid = valid_dataset.is_some();
+        let do_early_stopping = has_valid && early_stopping_rounds.is_some();
+
+        for iter in 1..=num_iterations {
             lgbm_call!(lightgbm3_sys::LGBM_BoosterUpdateOneIter(
                 handle,
                 &mut is_finished
             ))?;
+
+            if is_finished != 0 {
+                break;
+            }
+
+            if do_early_stopping {
+                let early_stop_rounds = early_stopping_rounds.unwrap();
+                let eval_results = Self::get_eval_at(handle, 1)?;
+                if let Some(&current_score) = eval_results.first() {
+                    let improved = match best_score {
+                        None => true,
+                        Some(best) => Self::is_score_better(current_score, best, parameters),
+                    };
+
+                    if improved {
+                        best_score = Some(current_score);
+                        rounds_without_improvement = 0;
+                    } else {
+                        rounds_without_improvement += 1;
+                        if rounds_without_improvement >= early_stop_rounds {
+                            let rollback_iters = rounds_without_improvement.min(iter);
+                            for _ in 0..rollback_iters {
+                                lgbm_call!(lightgbm3_sys::LGBM_BoosterRollbackOneIter(handle))?;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
         }
+
         Booster::new(handle)
+    }
+
+    /// Trains a new model with a custom objective function.
+    ///
+    /// This method allows you to define your own loss function by providing gradient and Hessian calculations.
+    /// The `objective_fn` takes current predictions, true labels, and writes gradients and hessians into the
+    /// provided mutable slices (pre-allocated by the caller for zero per-iteration allocation).
+    ///
+    /// # Example
+    /// ```no_run
+    /// use lightgbm3::{Dataset, Booster};
+    /// use serde_json::json;
+    ///
+    /// let xs = vec![1.0, 0.1, 0.7, 0.4, 0.9, 0.8];
+    /// let labels = vec![0.5, 1.2, 2.1];
+    /// let dataset = Dataset::from_slice(&xs, &labels, 2, true).unwrap();
+    ///
+    /// // Define a custom MSE loss function
+    /// let mut custom_mse = |preds: &[f64], labels: &[f32], grads: &mut [f32], hess: &mut [f32]| {
+    ///     for i in 0..preds.len() {
+    ///         grads[i] = 2.0 * (preds[i] as f32 - labels[i]);  // gradient
+    ///         hess[i] = 2.0;                                   // hessian
+    ///     }
+    /// };
+    ///
+    /// let params = json!{{
+    ///     "num_iterations": 10,
+    ///     "learning_rate": 0.1
+    /// }};
+    ///
+    /// let bst = Booster::train_with_custom_objective(dataset, &params, custom_mse).unwrap();
+    /// ```
+    pub fn train_with_custom_objective<F>(
+        dataset: Dataset,
+        parameters: &Value,
+        objective_fn: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(&[f64], &[f32], &mut [f32], &mut [f32]),
+    {
+        Self::train_with_valid_custom_objective(dataset, None, parameters, objective_fn)
+    }
+
+    /// Trains a new model with a custom objective function and an optional validation dataset.
+    ///
+    /// This method allows you to define your own loss function by providing gradient and Hessian calculations,
+    /// while also benefiting from validation metrics and early stopping.
+    pub fn train_with_valid_custom_objective<F>(
+        dataset: Dataset,
+        valid_dataset: Option<Dataset>,
+        parameters: &Value,
+        mut objective_fn: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(&[f64], &[f32], &mut [f32], &mut [f32]),
+    {
+        let num_iterations: i64 = parameters["num_iterations"].as_i64().unwrap_or(100);
+        let early_stopping_rounds: Option<i64> = parameters["early_stopping_rounds"].as_i64();
+
+        // Build parameters string, ensuring objective is set to "none"
+        let mut params_obj = parameters.as_object().unwrap().clone();
+        params_obj.insert(
+            "objective".to_string(),
+            serde_json::Value::String("none".to_string()),
+        );
+
+        let params_string = params_obj
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let params_cstring = CString::new(params_string).unwrap();
+
+        // Create booster
+        let mut handle = std::ptr::null_mut();
+        lgbm_call!(lightgbm3_sys::LGBM_BoosterCreate(
+            dataset.handle,
+            params_cstring.as_ptr(),
+            &mut handle
+        ))?;
+
+        if let Some(ref valid) = valid_dataset {
+            lgbm_call!(lightgbm3_sys::LGBM_BoosterAddValidData(
+                handle,
+                valid.handle
+            ))?;
+        }
+
+        // Get booster info
+        let mut n_classes: i32 = 0;
+        lgbm_call!(lightgbm3_sys::LGBM_BoosterGetNumClasses(
+            handle,
+            &mut n_classes
+        ))?;
+        let num_class = n_classes as usize;
+
+        // Get dataset info
+        let (n_rows, _) = dataset.size()?;
+        let mut labels_ptr: *const c_void = std::ptr::null();
+        let mut labels_len: i32 = 0;
+        let mut labels_type: i32 = 0;
+        let label_str = CString::new("label").unwrap();
+
+        lgbm_call!(lightgbm3_sys::LGBM_DatasetGetField(
+            dataset.handle,
+            label_str.as_ptr(),
+            &mut labels_len,
+            &mut labels_ptr,
+            &mut labels_type
+        ))?;
+        if labels_type != f32::get_c_api_dtype() {
+            return Err(Error::new("X values should have f32 type"));
+        }
+
+        let labels =
+            unsafe { std::slice::from_raw_parts(labels_ptr as *const f32, labels_len as usize) };
+
+        // Training loop with custom objective
+        let mut is_finished: i32 = 0;
+        let mut best_score: Option<f64> = None;
+        let mut rounds_without_improvement: i64 = 0;
+        let has_valid = valid_dataset.is_some();
+        let do_early_stopping = has_valid && early_stopping_rounds.is_some();
+
+        let mut predictions = vec![0.0f64; n_rows as usize * num_class];
+        let mut grads = vec![0.0f32; n_rows as usize * num_class];
+        let mut hess = vec![0.0f32; n_rows as usize * num_class];
+
+        for iter in 0..num_iterations {
+            // Get current predictions
+            let mut out_len: i64 = 0;
+            lgbm_call!(lightgbm3_sys::LGBM_BoosterGetPredict(
+                handle,
+                0, // data_idx: 0 for training data
+                &mut out_len,
+                predictions.as_mut_ptr()
+            ))?;
+
+            let expected_len = n_rows as i64 * num_class as i64;
+            if out_len != expected_len {
+                return Err(Error::new(format!(
+                    "LGBM_BoosterGetPredict returned {} predictions, expected {} (n_rows={}, num_class={})",
+                    out_len, expected_len, n_rows, num_class
+                )));
+            }
+
+            // Calculate gradients and hessians using custom objective
+            objective_fn(&predictions, labels, &mut grads, &mut hess);
+
+            // Update model with custom gradients and hessians
+            lgbm_call!(lightgbm3_sys::LGBM_BoosterUpdateOneIterCustom(
+                handle,
+                grads.as_ptr(),
+                hess.as_ptr(),
+                &mut is_finished
+            ))?;
+
+            if is_finished != 0 {
+                break;
+            }
+
+            if do_early_stopping {
+                let early_stop_rounds = early_stopping_rounds.unwrap();
+                let eval_results = Self::get_eval_at(handle, 1)?; // 1 for the first validation set
+                if let Some(&current_score) = eval_results.first() {
+                    let improved = match best_score {
+                        None => true,
+                        Some(best) => Self::is_score_better(current_score, best, parameters),
+                    };
+
+                    if improved {
+                        best_score = Some(current_score);
+                        rounds_without_improvement = 0;
+                    } else {
+                        rounds_without_improvement += 1;
+                        if rounds_without_improvement >= early_stop_rounds {
+                            let rollback_iters = early_stop_rounds.min(iter + 1);
+                            for _ in 0..rollback_iters {
+                                lgbm_call!(lightgbm3_sys::LGBM_BoosterRollbackOneIter(handle))?;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Booster::new(handle)
+    }
+
+    fn is_score_better(current: f64, best: f64, parameters: &Value) -> bool {
+        let higher_is_better = matches!(
+            parameters["metric"].as_str().unwrap_or_default(),
+            "auc" | "average_precision" | "map" | "ndcg" | "accuracy"
+        );
+        if higher_is_better {
+            current > best
+        } else {
+            current < best
+        }
+    }
+
+    fn get_eval_at(handle: BoosterHandle, data_idx: i32) -> Result<Vec<f64>> {
+        let mut num_evals: i32 = 0;
+        lgbm_call!(lightgbm3_sys::LGBM_BoosterGetEvalCounts(
+            handle,
+            &mut num_evals
+        ))?;
+
+        if num_evals == 0 {
+            return Ok(vec![]);
+        }
+
+        let mut out_len: i32 = 0;
+        let mut results: Vec<f64> = vec![0.0; num_evals as usize];
+        lgbm_call!(lightgbm3_sys::LGBM_BoosterGetEval(
+            handle,
+            data_idx,
+            &mut out_len,
+            results.as_mut_ptr()
+        ))?;
+
+        results.truncate(out_len as usize);
+        Ok(results)
     }
 
     fn real_predict<T: DType>(
@@ -245,7 +586,7 @@ impl Booster {
                         self.n_features)
             ));
         }
-        if flat_x.len() % n_features as usize != 0 {
+        if !flat_x.len().is_multiple_of(n_features as usize) {
             return Err(Error::new(format!(
                 "Invalid length of data: data.len()={}, n_features={}",
                 flat_x.len(),
@@ -258,21 +599,41 @@ impl Booster {
             .unwrap_or(CString::new(""))
             .unwrap();
         let mut out_length: c_longlong = 0;
-        let mut out_result: Vec<f64> = vec![Default::default(); n_rows * self.n_classes as usize];
-        lgbm_call!(lightgbm3_sys::LGBM_BoosterPredictForMat(
-            self.handle,
-            flat_x.as_ptr() as *const c_void,
-            T::get_c_api_dtype(),
-            n_rows as i32,
-            n_features,
-            if is_row_major { 1_i32 } else { 0_i32 }, // is_row_major
-            predict_type.into(),                      // predict_type
-            0_i32,                                    // start_iteration
-            self.max_iterations,                      // num_iteration, <= 0 means no limit
-            params_cstring.as_ptr(),
-            &mut out_length,
-            out_result.as_mut_ptr()
-        ))?;
+        let output_size = match predict_type {
+            PredictType::Contrib => n_rows * (self.n_features + 1) as usize,
+            _ => n_rows * self.n_classes as usize,
+        };
+        let mut out_result: Vec<f64> = vec![Default::default(); output_size];
+        if n_rows == 1 {
+            lgbm_call!(lightgbm3_sys::LGBM_BoosterPredictForMatSingleRow(
+                self.handle,
+                flat_x.as_ptr() as *const c_void,
+                T::get_c_api_dtype(),
+                n_features,
+                1,                   // is_row_major
+                predict_type.into(), // predict_type
+                0_i32,               // start_iteration
+                self.max_iterations, // num_iteration, <= 0 means no limit
+                params_cstring.as_ptr(),
+                &mut out_length,
+                out_result.as_mut_ptr()
+            ))?;
+        } else {
+            lgbm_call!(lightgbm3_sys::LGBM_BoosterPredictForMat(
+                self.handle,
+                flat_x.as_ptr() as *const c_void,
+                T::get_c_api_dtype(),
+                n_rows as i32,
+                n_features,
+                is_row_major as i32, // is_row_major
+                predict_type.into(), // predict_type
+                0_i32,               // start_iteration
+                self.max_iterations, // num_iteration, <= 0 means no limit
+                params_cstring.as_ptr(),
+                &mut out_length,
+                out_result.as_mut_ptr()
+            ))?;
+        }
 
         Ok(out_result)
     }
@@ -292,7 +653,7 @@ impl Booster {
     /// will have the size of `n_rows` by `n_classes`.
     ///
     /// Example:
-    /// ```compile_fail
+    /// ```ignore
     /// use serde_json::json;
     /// let y_pred = bst.predict_with_params(&xs, 10, true, "num_threads=1").unwrap();
     /// ```
@@ -310,6 +671,15 @@ impl Booster {
             PredictType::Normal,
             Some(params),
         )
+    }
+
+    pub fn predict_contrib<T: DType>(
+        &self,
+        flat_x: &[T],
+        n_features: i32,
+        is_row_major: bool,
+    ) -> Result<Vec<f64>> {
+        self.real_predict(flat_x, n_features, is_row_major, PredictType::Contrib, None)
     }
 
     /// Get raw scores given `&[f32]` or `&[f64]` slice of features. The resulting vector
@@ -333,7 +703,7 @@ impl Booster {
     /// will have the size of `n_rows` by `n_classes`.
     ///
     /// Example:
-    /// ```compile_fail
+    /// ```ignore
     /// use serde_json::json;
     /// let y_pred = bst.predict_with_params(&xs, 10, true, "num_threads=1").unwrap();
     /// ```
@@ -395,6 +765,25 @@ impl Booster {
             .collect())
     }
 
+    /// Fast predict for a single row. You must call [Booster::single_row_fast_init]
+    /// before calling this function.
+    pub fn predict_single_row_fast<T: DType>(&self, x: &[T]) -> Result<Vec<f64>> {
+        let Some(fast_config) = self.fast_config else {
+            return Err(Error::new(
+                "Call single_row_fast_init before calling predict_single_row_fast",
+            ));
+        };
+        let mut out_length = 0;
+        let mut out_result = vec![0.0; self.n_classes as usize];
+        lgbm_call!(lightgbm3_sys::LGBM_BoosterPredictForMatSingleRowFast(
+            fast_config,
+            x.as_ptr() as *const c_void,
+            &mut out_length,
+            out_result.as_mut_ptr()
+        ))?;
+        Ok(out_result)
+    }
+
     /// Get the number of classes.
     fn inner_num_classes(&self) -> Result<i32> {
         let mut num_classes = 0;
@@ -422,7 +811,7 @@ impl Booster {
             self.handle,
             &mut cur_iteration
         ))?;
-        Ok(cur_iteration + 1)
+        Ok(cur_iteration)
     }
 
     /// Gets features names.
@@ -438,14 +827,20 @@ impl Booster {
                     .into_raw()
             })
             .collect::<Vec<_>>();
-        lgbm_call!(lightgbm3_sys::LGBM_BoosterGetFeatureNames(
+        let res = lgbm_call!(lightgbm3_sys::LGBM_BoosterGetFeatureNames(
             self.handle,
             num_feature,
             &mut num_feature_names,
             feature_name_length,
             &mut out_buffer_len,
             out_strs.as_ptr() as *mut *mut c_char
-        ))?;
+        ));
+        if res.is_err() {
+            out_strs.into_iter().for_each(|ptr| unsafe {
+                let _ = CString::from_raw(ptr); // free()
+            });
+            return res.map(|()| Vec::new());
+        }
         let output: Vec<String> = out_strs
             .into_iter()
             .map(|s| unsafe { CString::from_raw(s).into_string().unwrap() })
@@ -470,6 +865,9 @@ impl Booster {
 impl Drop for Booster {
     fn drop(&mut self) {
         info!("Dropping booster with handle: {:?}", self.handle);
+        if let Some(fast_config) = self.fast_config.take() {
+            let _ = lgbm_call!(lightgbm3_sys::LGBM_FastConfigFree(fast_config));
+        }
         lgbm_call!(lightgbm3_sys::LGBM_BoosterFree(self.handle)).unwrap();
     }
 }
@@ -488,6 +886,7 @@ impl From<PredictType> for i32 {
         match value {
             PredictType::Normal => lightgbm3_sys::C_API_PREDICT_NORMAL as i32,
             PredictType::RawScore => lightgbm3_sys::C_API_PREDICT_RAW_SCORE as i32,
+            PredictType::Contrib => lightgbm3_sys::C_API_PREDICT_CONTRIB as i32,
         }
     }
 }
@@ -514,7 +913,21 @@ mod tests {
                 "num_iterations": 1,
                 "objective": "binary",
                 "metric": "auc",
-                "data_random_seed": 0
+                "data_random_seed": 0,
+                "verbose": 0,
+            }
+        };
+        params
+    }
+
+    fn _train_params() -> Value {
+        let params = json! {
+            {
+                "num_iterations": 10,
+                "objective": "binary",
+                "metric": "auc",
+                "data_random_seed": 0,
+                "verbose": 0,
             }
         };
         params
@@ -522,36 +935,16 @@ mod tests {
 
     #[test]
     fn predict_from_vec_of_vec() {
-        let params = json! {
-            {
-                "num_iterations": 10,
-                "objective": "binary",
-                "metric": "auc",
-                "data_random_seed": 0
-            }
-        };
-        let bst = _train_booster(&params);
+        let bst = _train_booster(&_train_params());
         let feature = vec![vec![0.5; 28], vec![0.0; 28], vec![0.9; 28]];
-        let result = bst.predict_from_vec_of_vec(feature, true).unwrap();
-        let mut normalized_result = Vec::new();
-        for r in &result {
-            normalized_result.push(if r[0] > 0.5 { 1 } else { 0 });
-        }
-        assert_eq!(normalized_result, vec![0, 0, 1]);
+        let y_preds = bst.predict_from_vec_of_vec(feature, true).unwrap();
+        let class_preds: Vec<i8> = y_preds.iter().flatten().map(|y| y.round() as i8).collect();
+        assert_eq!(class_preds, vec![0, 0, 1]);
     }
 
     #[test]
     fn predict_with_params() {
-        let params = json! {
-            {
-                "num_iterations": 10,
-                "objective": "binary",
-                "metric": "auc",
-                "data_random_seed": 0
-            }
-        };
-        let bst = _train_booster(&params);
-        // let feature = vec![vec![0.5; 28], vec![0.0; 28], vec![0.9; 28]];
+        let bst = _train_booster(&_train_params());
         let mut feature = [0.0; 28 * 3];
         for i in 0..28 {
             feature[i] = 0.5;
@@ -560,14 +953,42 @@ mod tests {
             feature[i] = 0.9;
         }
 
-        let result = bst
+        let y_preds = bst
             .predict_with_params(&feature, 28, true, "num_threads=1")
             .unwrap();
-        let mut normalized_result = Vec::new();
-        for r in &result {
-            normalized_result.push(if *r > 0.5 { 1 } else { 0 });
-        }
-        assert_eq!(normalized_result, vec![0, 0, 1]);
+        let class_preds: Vec<i8> = y_preds.iter().map(|y| y.round() as i8).collect();
+        assert_eq!(class_preds, vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn predict_single_row() {
+        let bst = _train_booster(&_train_params());
+        let row = [0.9; 28];
+
+        let y_preds = bst.predict(&row, 28, true).unwrap();
+        assert_eq!(y_preds.len(), 1);
+        let pred = if y_preds[0] > 0.5 { 1 } else { 0 };
+        assert_eq!(pred, 1);
+    }
+
+    #[test]
+    fn predict_single_row_fast() {
+        let mut bst = _train_booster(&_train_params());
+        let row = [0.9; 28];
+
+        bst.single_row_fast_init::<f64>(None).unwrap();
+        let y_preds = bst.predict_single_row_fast(&row).unwrap();
+        assert_eq!(y_preds.len(), 1);
+        let pred = if y_preds[0] > 0.5 { 1 } else { 0 };
+        assert_eq!(pred, 1);
+    }
+
+    #[test]
+    fn predict_single_row_fast_err() {
+        let bst = _train_booster(&_train_params());
+        let row = [0.9; 28];
+
+        assert!(bst.predict_single_row_fast(&row).is_err());
     }
 
     #[test]
@@ -583,7 +1004,8 @@ mod tests {
         let params = _default_params();
         let bst = _train_booster(&params);
         let feature_importance = bst.feature_importance(ImportanceType::Gain).unwrap();
-        assert_eq!(feature_importance, vec![0.0; 28]);
+        assert_eq!(feature_importance.len(), bst.n_features as usize);
+        assert!(feature_importance.iter().sum::<f64>() > 0.0);
     }
 
     #[test]
@@ -621,5 +1043,65 @@ mod tests {
         assert!(!booster_file_content.is_empty());
         assert_eq!(Ok(booster_file_content.clone()), bst.save_string());
         assert!(Booster::from_string(&booster_file_content).is_ok());
+    }
+
+    fn _read_test_file_with_ref(train: &Dataset) -> Result<Dataset> {
+        Dataset::from_file_with_reference(
+            "lightgbm3-sys/lightgbm/examples/binary_classification/binary.test",
+            Some(train),
+        )
+    }
+
+    #[test]
+    fn train_with_valid_no_early_stopping() {
+        let train_dataset = _read_train_file().unwrap();
+        let valid_dataset = _read_test_file_with_ref(&train_dataset).unwrap();
+        let bst = Booster::train_with_valid(train_dataset, Some(valid_dataset), &_train_params())
+            .unwrap();
+        assert_eq!(bst.num_iterations(), 10);
+    }
+
+    #[test]
+    fn train_with_early_stopping() {
+        let train_dataset = _read_train_file().unwrap();
+        let valid_dataset = _read_test_file_with_ref(&train_dataset).unwrap();
+        let params = json! {
+            {
+                "num_iterations": 100,
+                "objective": "binary",
+                "metric": "auc",
+                "data_random_seed": 0,
+                "early_stopping_rounds": 5,
+                "verbose": 0,
+            }
+        };
+        let bst = Booster::train_with_valid(train_dataset, Some(valid_dataset), &params).unwrap();
+        assert!(
+            bst.num_iterations() < 100,
+            "Expected early stopping to trigger before 100 iterations, got {}",
+            bst.num_iterations()
+        );
+    }
+
+    #[test]
+    fn train_with_early_stopping_logloss() {
+        let train_dataset = _read_train_file().unwrap();
+        let valid_dataset = _read_test_file_with_ref(&train_dataset).unwrap();
+        let params = json! {
+            {
+                "num_iterations": 100,
+                "objective": "binary",
+                "metric": "binary_logloss",
+                "data_random_seed": 0,
+                "early_stopping_rounds": 5,
+                "verbose": 0,
+            }
+        };
+        let bst = Booster::train_with_valid(train_dataset, Some(valid_dataset), &params).unwrap();
+        assert!(
+            bst.num_iterations() < 100,
+            "Expected early stopping to trigger before 100 iterations, got {}",
+            bst.num_iterations()
+        );
     }
 }

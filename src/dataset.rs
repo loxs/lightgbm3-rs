@@ -1,6 +1,9 @@
 //! LightGBM Dataset used for training
 
-use lightgbm3_sys::{DatasetHandle, C_API_DTYPE_FLOAT32, C_API_DTYPE_FLOAT64};
+use lightgbm3_sys::{
+    DatasetHandle, LGBM_DatasetGetFeatureNames, LGBM_DatasetSetFeatureNames, C_API_DTYPE_FLOAT32,
+    C_API_DTYPE_FLOAT64,
+};
 use std::os::raw::c_void;
 use std::{self, ffi::CString};
 
@@ -27,12 +30,14 @@ pub trait DType: private::Sealed {
 }
 
 impl DType for f32 {
+    #[inline(always)]
     fn get_c_api_dtype() -> i32 {
         C_API_DTYPE_FLOAT32 as i32
     }
 }
 
 impl DType for f64 {
+    #[inline(always)]
     fn get_c_api_dtype() -> i32 {
         C_API_DTYPE_FLOAT64 as i32
     }
@@ -47,6 +52,97 @@ impl Dataset {
     /// Creates a new Dataset object from the LightGBM's DatasetHandle.
     fn new(handle: DatasetHandle) -> Self {
         Self { handle }
+    }
+
+    /// Set feature names for the dataset.
+    ///
+    /// This allows the model to save and display correct feature names instead of generic "Column_X".
+    pub fn set_feature_names(&mut self, feature_names: &[String]) -> Result<()> {
+        // 1. Verify that the number of feature names matches the dataset
+        let (_, n_features) = self.size()?;
+        if feature_names.len() as i32 != n_features {
+            return Err(Error::new(format!(
+                "Input feature names count ({}) does not match dataset feature count ({})",
+                feature_names.len(),
+                n_features
+            )));
+        }
+
+        // 2. Convert Rust Strings to CStrings (handling null-termination and memory layout)
+        let c_names: Vec<CString> = feature_names
+            .iter()
+            .map(|s| {
+                CString::new(s.as_bytes())
+                    .map_err(|e| Error::new(format!("Invalid feature name string: {}", e)))
+            })
+            .collect::<Result<Vec<CString>>>()?;
+
+        // 3. Create an array of pointers to the CString internal buffers (char**)
+        let c_ptrs: Vec<*const std::os::raw::c_char> = c_names.iter().map(|s| s.as_ptr()).collect();
+
+        // 4. Call LightGBM C API
+        // int LGBM_DatasetSetFeatureNames(DatasetHandle handle, const char** feature_names, int num_features);
+        lgbm_call!(LGBM_DatasetSetFeatureNames(
+            self.handle,
+            c_ptrs.clone().as_mut_ptr(),
+            feature_names.len() as i32
+        ))?;
+
+        Ok(())
+    }
+
+    /// Get feature names from the dataset.
+    pub fn get_feature_names(&self) -> Result<Vec<String>> {
+        // 1. Get the number of features
+        let (_, n_features) = self.size()?;
+        let len = n_features as usize;
+
+        // 2. Prepare buffers
+        // LightGBM C API requires the caller to allocate memory.
+        // We assume a maximum feature name length of 256 bytes, which is usually sufficient.
+        const MAX_NAME_LEN: usize = 256;
+
+        // Create 'len' buffers, each of size MAX_NAME_LEN, initialized to 0
+        let mut name_buffers: Vec<Vec<u8>> = vec![vec![0u8; MAX_NAME_LEN]; len];
+
+        // Create an array of pointers to these buffers (char**)
+        let mut name_ptrs: Vec<*mut std::os::raw::c_char> = name_buffers
+            .iter_mut()
+            .map(|buf| buf.as_mut_ptr() as *mut std::os::raw::c_char)
+            .collect();
+
+        let mut num_features_out = 0;
+        let mut required_len_out = 0;
+
+        // 3. Call C API
+        // int LGBM_DatasetGetFeatureNames(DatasetHandle handle, const int len, int* num_features,
+        //     const size_t max_feature_name_len, size_t* feature_name_len, char** feature_names);
+        lgbm_call!(LGBM_DatasetGetFeatureNames(
+            self.handle,
+            len as i32,
+            &mut num_features_out,
+            MAX_NAME_LEN,
+            &mut required_len_out,
+            name_ptrs.as_mut_ptr()
+        ))?;
+
+        // 4. Convert C strings to Rust Strings
+        let result = name_ptrs
+            .iter()
+            .copied()
+            .take(num_features_out as usize)
+            .enumerate()
+            .map(|(i, ptr)| {
+                let c_str = unsafe { std::ffi::CStr::from_ptr(ptr) };
+                c_str.to_str().map(|s| s.to_string()).map_err(|e| {
+                    Error::new(format!(
+                        "Invalid UTF-8 in feature name at index {}: {}",
+                        i, e
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(result)
     }
 
     /// Creates a new `Dataset` (x, labels) from flat `&[f64]` slice with a specified number
@@ -74,10 +170,37 @@ impl Dataset {
         n_features: i32,
         is_row_major: bool,
     ) -> Result<Self> {
+        Self::from_slice_with_reference(flat_x, label, n_features, is_row_major, None)
+    }
+
+    /// Creates a new `Dataset` from flat slice with a reference dataset.
+    ///
+    /// When creating a validation dataset, pass the training dataset as reference
+    /// to ensure consistent bin mappers. This is required for early stopping.
+    ///
+    /// # Example
+    /// ```
+    /// use lightgbm3::Dataset;
+    ///
+    /// let train_x: Vec<f64> = vec![1.0, 0.1, 0.7, 0.4, 0.9, 0.8];
+    /// let train_label = vec![0.0, 0.0, 1.0];
+    /// let train = Dataset::from_slice(&train_x, &train_label, 2, true).unwrap();
+    ///
+    /// let valid_x: Vec<f64> = vec![0.5, 0.5, 0.2, 0.8];
+    /// let valid_label = vec![0.0, 1.0];
+    /// let valid = Dataset::from_slice_with_reference(&valid_x, &valid_label, 2, true, Some(&train)).unwrap();
+    /// ```
+    pub fn from_slice_with_reference<T: DType>(
+        flat_x: &[T],
+        label: &[f32],
+        n_features: i32,
+        is_row_major: bool,
+        reference: Option<&Dataset>,
+    ) -> Result<Self> {
         if n_features <= 0 {
             return Err(Error::new("number of features should be greater than 0"));
         }
-        if flat_x.len() % n_features as usize != 0 {
+        if !flat_x.len().is_multiple_of(n_features as usize) {
             return Err(Error::new(
                 "number of features doesn't correspond to slice size",
             ));
@@ -94,17 +217,17 @@ impl Dataset {
         }
         let params = CString::new("").unwrap();
         let label_str = CString::new("label").unwrap();
-        let reference = std::ptr::null_mut(); // not used
-        let mut dataset_handle = std::ptr::null_mut(); // will point to a new DatasetHandle
+        let ref_handle = reference.map_or(std::ptr::null_mut(), |r| r.handle);
+        let mut dataset_handle = std::ptr::null_mut();
 
         lgbm_call!(lightgbm3_sys::LGBM_DatasetCreateFromMat(
             flat_x.as_ptr() as *const c_void,
             T::get_c_api_dtype(),
             n_rows as i32,
             n_features,
-            if is_row_major { 1_i32 } else { 0_i32 }, // is_row_major – 1 for row-major, 0 for column-major
+            if is_row_major { 1_i32 } else { 0_i32 },
             params.as_ptr(),
-            reference,
+            ref_handle,
             &mut dataset_handle
         ))?;
 
@@ -113,7 +236,7 @@ impl Dataset {
             label_str.as_ptr(),
             label.as_ptr() as *const c_void,
             n_rows as i32,
-            C_API_DTYPE_FLOAT32 as i32 // labels should be always float32
+            C_API_DTYPE_FLOAT32 as i32
         ))?;
 
         Ok(Self::new(dataset_handle))
@@ -169,14 +292,31 @@ impl Dataset {
     /// let dataset = Dataset::from_file(&"lightgbm3-sys/lightgbm/examples/binary_classification/binary.train").unwrap();
     /// ```
     pub fn from_file(file_path: &str) -> Result<Self> {
+        Self::from_file_with_reference(file_path, None)
+    }
+
+    /// Create a new `Dataset` from file with a reference dataset.
+    ///
+    /// When creating a validation dataset, pass the training dataset as reference
+    /// to ensure consistent bin mappers. This is required for early stopping.
+    ///
+    /// # Example
+    /// ```
+    /// use lightgbm3::Dataset;
+    ///
+    /// let train = Dataset::from_file(&"lightgbm3-sys/lightgbm/examples/binary_classification/binary.train").unwrap();
+    /// let valid = Dataset::from_file_with_reference(&"lightgbm3-sys/lightgbm/examples/binary_classification/binary.test", Some(&train)).unwrap();
+    /// ```
+    pub fn from_file_with_reference(file_path: &str, reference: Option<&Dataset>) -> Result<Self> {
         let file_path_str = CString::new(file_path).unwrap();
         let params = CString::new("").unwrap();
         let mut handle = std::ptr::null_mut();
+        let ref_handle = reference.map_or(std::ptr::null_mut(), |r| r.handle);
 
         lgbm_call!(lightgbm3_sys::LGBM_DatasetCreateFromFile(
             file_path_str.as_ptr(),
             params.as_ptr(),
-            std::ptr::null_mut(),
+            ref_handle,
             &mut handle
         ))?;
 
@@ -212,27 +352,27 @@ impl Dataset {
         if m == 0 {
             return Err(Error::new("DataFrame is empty"));
         }
-        if n < 1 {
+        if n < 2 {
             return Err(Error::new(
-                "DataFrame should contain at least 1 feature column and 1 label column",
+                "DataFrame should contain at least 1 feature column and a label column",
             ));
         }
 
         // Take label from the dataframe:
-        let label_series = dataframe.select_columns([label_column])?[0].cast(&Float32)?;
+        let label_series = dataframe
+            .drop_in_place(label_column)?
+            .cast(&DataType::Float32)?;
         if label_series.null_count() != 0 {
             return Err(Error::new(
                 "Can't create a dataset with null values in label array",
             ));
         }
-        let _ = dataframe.drop_in_place(label_column)?;
 
-        let mut label_values = Vec::with_capacity(m);
         let label_values_ca = label_series.f32()?;
-        label_values.extend(label_values_ca.into_no_null_iter());
+        let label_values: Vec<f32> = label_values_ca.into_no_null_iter().collect();
 
         let mut feature_values = Vec::with_capacity(m * (n - 1));
-        for series in dataframe.get_columns().iter() {
+        for series in dataframe.columns() {
             if series.null_count() != 0 {
                 return Err(Error::new(
                     "Can't create a dataset with null values in feature array",
@@ -243,7 +383,60 @@ impl Dataset {
             let ca = series.f32()?;
             feature_values.extend(ca.into_no_null_iter());
         }
+
         Self::from_slice(&feature_values, &label_values, (n - 1) as i32, false)
+    }
+
+    /// Create a new `Dataset` from a polars DataFrame with a reference dataset.
+    ///
+    /// When creating a validation dataset, pass the training dataset as reference
+    /// to ensure consistent bin mappers. This is required for early stopping.
+    #[cfg(feature = "polars")]
+    pub fn from_dataframe_with_reference(
+        mut dataframe: DataFrame,
+        label_column: &str,
+        reference: Option<&Dataset>,
+    ) -> Result<Self> {
+        let (m, n) = dataframe.shape();
+        if m == 0 {
+            return Err(Error::new("DataFrame is empty"));
+        }
+        if n < 2 {
+            return Err(Error::new(
+                "DataFrame should contain at least 1 feature column and a label column",
+            ));
+        }
+
+        let label_series = dataframe.drop_in_place(label_column)?.cast(&Float32)?;
+        if label_series.null_count() != 0 {
+            return Err(Error::new(
+                "Can't create a dataset with null values in label array",
+            ));
+        }
+
+        let label_values_ca = label_series.f32()?;
+        let label_values: Vec<f32> = label_values_ca.into_no_null_iter().collect();
+
+        let mut feature_values = Vec::with_capacity(m * (n - 1));
+        for series in dataframe.columns() {
+            if series.null_count() != 0 {
+                return Err(Error::new(
+                    "Can't create a dataset with null values in feature array",
+                ));
+            }
+
+            let series = series.cast(&Float32)?;
+            let ca = series.f32()?;
+            feature_values.extend(ca.into_no_null_iter());
+        }
+
+        Self::from_slice_with_reference(
+            &feature_values,
+            &label_values,
+            (n - 1) as i32,
+            false,
+            reference,
+        )
     }
 
     /// Get the size of Dataset as `(n_rows, n_features)` tuple
@@ -417,5 +610,18 @@ mod tests {
         let weights_long = vec![0.5, 1.0, 2.0, 0.5, 0.1, 0.1];
         assert!(dataset.set_weights(&weights_short).is_err());
         assert!(dataset.set_weights(&weights_long).is_err());
+    }
+
+    #[test]
+    fn test_feature_names() {
+        let xs = vec![vec![1.0, 0.1], vec![0.7, 0.4]];
+        let labels = vec![0.0, 1.0];
+        let mut dataset = Dataset::from_vec_of_vec(xs, labels, true).unwrap();
+
+        let names = vec!["age".to_string(), "height".to_string()];
+        dataset.set_feature_names(&names).unwrap();
+
+        let retrieved_names = dataset.get_feature_names().unwrap();
+        assert_eq!(names, retrieved_names);
     }
 }
