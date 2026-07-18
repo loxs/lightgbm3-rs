@@ -145,13 +145,7 @@ impl Booster {
         }
 
         let params_cstring = if let Some(params) = params {
-            let params_string = params
-                .as_object()
-                .unwrap()
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect::<Vec<_>>()
-                .join(" ");
+            let params_string = crate::params_to_string(params.as_object().unwrap());
             CString::new(params_string).unwrap()
         } else {
             CString::default()
@@ -273,13 +267,7 @@ impl Booster {
         let num_iterations: i64 = parameters["num_iterations"].as_i64().unwrap_or(100);
         let early_stopping_rounds: Option<i64> = parameters["early_stopping_rounds"].as_i64();
 
-        let params_string = parameters
-            .as_object()
-            .unwrap()
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let params_string = crate::params_to_string(parameters.as_object().unwrap());
         let params_cstring = CString::new(params_string).unwrap();
 
         let mut handle = std::ptr::null_mut();
@@ -405,11 +393,7 @@ impl Booster {
             serde_json::Value::String("none".to_string()),
         );
 
-        let params_string = params_obj
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let params_string = crate::params_to_string(&params_obj);
         let params_cstring = CString::new(params_string).unwrap();
 
         // Create booster

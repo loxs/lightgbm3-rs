@@ -57,6 +57,16 @@ pub use error::{Error, Result};
 #[macro_use]
 extern crate tracing;
 
+/// Serializes a LightGBM params JSON object into the `key=value key2=value2` string form
+/// LightGBM's C API expects (via `Config::Str2Map`/`KV2Map`, which itself strips any quote
+/// characters `serde_json::Value`'s `Display` impl adds around string values).
+pub fn params_to_string(params: &serde_json::Map<String, serde_json::Value>) -> String {
+    params
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Get index of the element in a slice with the maximum value
 pub fn argmax<T: PartialOrd>(xs: &[T]) -> usize {
