@@ -372,7 +372,7 @@ impl Dataset {
         let label_values: Vec<f32> = label_values_ca.into_no_null_iter().collect();
 
         let mut feature_values = Vec::with_capacity(m * (n - 1));
-        for series in dataframe.columns() {
+        for series in dataframe.get_columns() {
             if series.null_count() != 0 {
                 return Err(Error::new(
                     "Can't create a dataset with null values in feature array",
@@ -418,7 +418,7 @@ impl Dataset {
         let label_values: Vec<f32> = label_values_ca.into_no_null_iter().collect();
 
         let mut feature_values = Vec::with_capacity(m * (n - 1));
-        for series in dataframe.columns() {
+        for series in dataframe.get_columns() {
             if series.null_count() != 0 {
                 return Err(Error::new(
                     "Can't create a dataset with null values in feature array",
